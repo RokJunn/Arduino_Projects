@@ -1,0 +1,284 @@
+#include <Servo.h>
+#include <Stepper.h>
+#include <pitches.h>
+#include <ADXL345.h>
+#include <LiquidCrystal.h>
+
+
+// -------- 세팅용 변수 ---------
+int melody[][2] = { // 0은 쉼표, 멜로디 저장용
+  {NOTE_E6, 120}, {NOTE_D6, 120}, {NOTE_FS5, 240}, {NOTE_GS5, 240}, 
+  {NOTE_CS6, 120}, {NOTE_B5, 120}, {NOTE_E5, 240}, {NOTE_FS5, 240}, 
+  {NOTE_B5, 120}, {NOTE_A5, 120}, {NOTE_CS5, 240}, {NOTE_E5, 240},
+  {NOTE_A5, 240}, {0, 480}
+};
+byte customChar[][8] = {
+  {0b00000, 0b00000, 0b00100, 0b01110, 0b01110, 0b00100, 0b00000, 0b00000}
+}; // 점
+
+
+// -------- 변동 값 변수 설정 -------
+unsigned long sterTime = 30; // 살균시간, [s]
+unsigned long sprayTick = 4; // 분사주기, [s]
+
+int angle = 120; // [360도 회전 시 필요한 스탭 수,]
+int mapAngle = map(angle, 0, 360, 0, 2048);
+
+
+// -------- 기타 자유선언 전역변수 ------
+unsigned long time_previous, time_current, servoTimes, ledTime;
+unsigned long previous, current;
+float readTemp, maxTemp = 50; // ['C]
+
+bool coverOpen = false; bool sterStart = false;
+bool startBtnBefore = false, coverBtnBefore = false;
+bool beginSetTrigger = true;
+
+ADXL345 adxl;
+byte interrupts;
+
+
+// ------- 핀 번호 설정 --------
+/* 0, 1은 컴퓨터 Serial 확인용.
+ * 18, 19는 Serial1 통신용. (블루투스)
+ * 20, 21은 가속도 핀 전용. */
+int servoPin1 = 7, servoPin2 = 8; // 서보 핀
+Servo myServo1, myServo2;
+int startButton = 10, coverButton = 11; // 버튼 핀
+int uvLedPin = 13; // LED 출력 핀
+
+// pin No. RS, E, DB4, DB5, DB6, DB7
+LiquidCrystal lcd(30, 31, 32, 33, 34, 35); // 30~35
+
+// 변환각도, IN4, IN2, IN3, IN1
+Stepper maskStepper1(mapAngle, 41, 39, 40, 38); // 38~41
+Stepper maskStepper2(mapAngle, 47, 45, 46, 44); // 44~47
+Stepper coverStepper(mapAngle, 53, 51, 52, 50); // 50~53
+
+int tempPin = 54; // 온도 핀 - A0
+int pressPin1 = 56, pressPin2 = 57; // 압력 센서 - A2, A3
+int speakerPin = 69; // 스피커 핀 - A15
+
+
+
+void setup(){
+  sterTime = sterTime * 1000; // 소독시간 조정 [ms]
+  sprayTick = sprayTick * 1000; // spray 주기 조정 [ms]
+  pinMode(startButton, INPUT);
+  pinMode(coverButton, INPUT);
+  pinMode(tempPin, INPUT);
+  pinMode(pressPin1, INPUT); pinMode(pressPin2, INPUT);
+  pinMode(speakerPin, OUTPUT);
+  pinMode(uvLedPin, OUTPUT); digitalWrite(uvLedPin, LOW);
+  myServo1.attach(servoPin1); myServo1.write(0);
+  myServo2.attach(servoPin2); myServo2.write(180);
+  Serial1.begin(9600); // bluetooth 통신 [18, 19]
+  lcd.begin(16, 2);
+  adxlSetting();
+  alcoholCheck();
+}
+
+
+void loop(){
+  // -- 개폐 버튼 누를 시 구문. --
+  if(digitalRead(coverButton)){
+    if(coverBtnBefore == false){
+      coverBtnBefore = true;
+      if (sterStart == true){ // 실수로 개폐버튼 누를시 강제 종료
+        error();
+      }
+      motorOpen();
+    }
+    delay(10);
+  }else coverBtnBefore = false;
+  
+  // -- 시작 버튼 누를 시 구문. --
+  if(digitalRead(startButton)){
+    if(coverOpen == false && startBtnBefore == false){
+      startBtnBefore = true;
+      if (sterStart == false) sterStart = true;
+      else {
+        sterStart = false;
+        digitalWrite(uvLedPin, LOW);
+        alcoholCheck();
+      }
+    }
+    delay(10);
+  }else startBtnBefore = false; 
+  
+  // 동작 수행
+  if(sterStart){
+    if(beginSetTrigger){ // 첫 설정 트리거
+      time_previous = millis();
+      beginSetTrigger = false;
+      servoTimes = 1;
+      digitalWrite(uvLedPin, HIGH);
+      ledTime = 1000;
+      maskStepper1.setSpeed(20); // 느리게 속도 조정
+      maskStepper2.setSpeed(20);
+    }
+    else{ // 기본적인 작동 상태
+      time_current = millis();
+      unsigned long times = time_current - time_previous;
+      maskStepper1.step(5); // 마스크가 천천히 돌도록 움직임.
+      maskStepper2.step(-5);
+      if(times >= ledTime){ // 초마다 led 잔여시간 변경
+        ledWork(times); ledTime += 1000;
+      }
+      if(times >= sterTime){ // 완료상태
+        sterStart = false;
+        beginSetTrigger = true;
+        digitalWrite(uvLedPin, LOW);
+        ledWork(sterTime);
+        melodySong(); melodySong();
+        alcoholCheck();
+        while(1){ // 블루투스 통신용
+          current = millis();
+          if(current - previous >= 1000) {
+            Serial1.println("완료되었습니다.");
+            previous = current;
+          }
+          // 블루투스 트리거 용.
+          if(digitalRead(coverButton) || digitalRead(startButton)) break;
+        }
+      }else if(times >= sprayTick*servoTimes){ // 서보모터 작동
+        spray(times); servoTimes++;
+      }
+      if(overTemp() || isActive()){ // 이상 온도 감지 및 충격 감지
+        error();
+      }
+    }
+  }else{
+    beginSetTrigger = true;
+  }
+}
+
+
+void melodySong(){ // 멜로디 출력 기능
+  for(int notes=0; notes < sizeof(melody)/sizeof(int)/2; notes++){
+    tone(speakerPin, melody[notes][0], melody[notes][1]);
+    delay(melody[notes][1]);
+    noTone(speakerPin);
+  }
+}
+
+void spray(unsigned long times){ // 스프레이 뿌리는 기능
+  myServo1.write(180); myServo2.write(0);
+  delay(1000);
+  ledWork(times + 1000); ledTime += 1000;
+  myServo1.write(0); myServo2.write(180);
+  delay(1000);
+  ledWork(times + 2000); ledTime += 1000;
+}
+
+void ledInfo(){ // 맨 처음 출력 문구
+  lcd.createChar(0, customChar[0]);
+  lcd.clear();
+  lcd.write(byte(0));
+  lcd.print("Mask Sterilizer");
+}
+
+void ledWork(unsigned long times){ // 작동 시 자동으로 출력하는 문구
+  times = sterTime - times; times /= 1000;
+  int minutes = times/60, seconds = times%60;
+  lcd.clear();
+  lcd.print("Left over time >> ");
+  lcd.setCursor(0, 1);
+  lcd.print(String(minutes) + ':' + String(seconds));
+  
+  Serial1.print(String(minutes) + ':');
+  if(seconds < 10) 
+    Serial1.println(String("0")+seconds);
+  else 
+    Serial1.println(seconds);
+}
+
+void motorOpen(){ // 커버모터 오픈
+  coverStepper.setSpeed(40);
+  if(coverOpen){coverStepper.step(mapAngle); coverOpen=false;}
+  else{coverStepper.step(-mapAngle); coverOpen=true;}
+}
+
+bool overTemp(){ // 온도 과부하 판별
+  readTemp = analogRead(tempPin);
+  readTemp = readTemp * 5 * 100 / 1024;
+  if(maxTemp <= readTemp) return true;
+  else return false;
+}
+
+bool isActive(){ // 자리 임의이동 판별
+  interrupts = adxl.getInterruptSource();
+  if(adxl.triggered(interrupts, ADXL345_ACTIVITY)) return true;
+  else return false;
+}
+
+void error(){ // 에러시,
+  sterStart = false;
+  digitalWrite(uvLedPin, LOW);
+  alcoholCheck();
+  tone(speakerPin, NOTE_E6, 1500);
+  delay(1500);
+  noTone(speakerPin);
+}
+
+void alcoholCheck(){ // 알콜 체크 및 초기구문 출력
+  int sensorVal1 = analogRead(pressPin1);
+  int sensorVal2 = analogRead(pressPin2);
+  int weight1 = map(sensorVal1, 150, 500, 0, 100);
+  int weight2 = map(sensorVal2, 150, 500, 0, 100);
+  // weight1 = 300; weight2 = 300; // 필요시 삭제하면 측정가능.
+  ledInfo(); // LED 초기 정보 출력
+  if((weight1 <= 0) || (weight2 <= 0)){
+    lcd.setCursor(0, 1);
+    lcd.print("Alcohol need!");
+  }
+}
+
+void adxlSetting(){
+  adxl.powerOn();
+
+  //set activity/ inactivity thresholds (0-255)
+  adxl.setActivityThreshold(75); //62.5mg per increment
+  adxl.setInactivityThreshold(75); //62.5mg per increment
+  adxl.setTimeInactivity(10); // how many seconds of no activity is inactive?
+ 
+  //look of activity movement on this axes - 1 == on; 0 == off 
+  adxl.setActivityX(1);
+  adxl.setActivityY(1);
+  adxl.setActivityZ(1);
+ 
+  //look of inactivity movement on this axes - 1 == on; 0 == off
+  adxl.setInactivityX(1);
+  adxl.setInactivityY(1);
+  adxl.setInactivityZ(1);
+ 
+  //look of tap movement on this axes - 1 == on; 0 == off
+  adxl.setTapDetectionOnX(0);
+  adxl.setTapDetectionOnY(0);
+  adxl.setTapDetectionOnZ(1);
+ 
+  //set values for what is a tap, and what is a double tap (0-255)
+  adxl.setTapThreshold(50); //62.5mg per increment
+  adxl.setTapDuration(15); //625us per increment
+  adxl.setDoubleTapLatency(80); //1.25ms per increment
+  adxl.setDoubleTapWindow(200); //1.25ms per increment
+ 
+  //set values for what is considered freefall (0-255)
+  adxl.setFreeFallThreshold(7); //(5 - 9) recommended - 62.5mg per increment
+  adxl.setFreeFallDuration(45); //(20 - 70) recommended - 5ms per increment
+ 
+  //setting all interrupts to take place on int pin 1
+  //I had issues with int pin 2, was unable to reset it
+  adxl.setInterruptMapping( ADXL345_INT_SINGLE_TAP_BIT,   ADXL345_INT1_PIN );
+  adxl.setInterruptMapping( ADXL345_INT_DOUBLE_TAP_BIT,   ADXL345_INT1_PIN );
+  adxl.setInterruptMapping( ADXL345_INT_FREE_FALL_BIT,    ADXL345_INT1_PIN );
+  adxl.setInterruptMapping( ADXL345_INT_ACTIVITY_BIT,     ADXL345_INT1_PIN );
+  adxl.setInterruptMapping( ADXL345_INT_INACTIVITY_BIT,   ADXL345_INT1_PIN );
+ 
+  //register interrupt actions - 1 == on; 0 == off  
+  adxl.setInterrupt( ADXL345_INT_SINGLE_TAP_BIT, 1);
+  adxl.setInterrupt( ADXL345_INT_DOUBLE_TAP_BIT, 1);
+  adxl.setInterrupt( ADXL345_INT_FREE_FALL_BIT,  1);
+  adxl.setInterrupt( ADXL345_INT_ACTIVITY_BIT,   1);
+  adxl.setInterrupt( ADXL345_INT_INACTIVITY_BIT, 1);
+}
